@@ -1,1 +1,2 @@
-EPR in Reimer lab
+# EPR spectrometer control software
+I am writing the code for AWG right now...
