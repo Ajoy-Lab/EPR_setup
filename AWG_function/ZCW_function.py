@@ -121,7 +121,7 @@ class segment(object):
         inst.send_scpi_cmd(':INST:CHAN {0}'.format(ch))
 
 
-
+131
 
 
 
