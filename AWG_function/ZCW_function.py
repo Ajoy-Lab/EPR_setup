@@ -203,8 +203,8 @@ class segment(object):
             Q = np.zeros(length)
         elif type == 'sine':
             degree_to_radian = np.pi / 180
-            I = amplitude * np.cos(degree_to_radian * phase)
-            Q = amplitude * np.sin(degree_to_radian * phase)
+            I = amplitude * np.cos(degree_to_radian * phase)*np.ones(length)
+            Q = amplitude * np.sin(degree_to_radian * phase)*np.ones(length)
         else:
             raise ValueError("are you entering the correct pulse type?")
         self.I = np.append(self.I, I)
