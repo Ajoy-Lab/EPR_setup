@@ -6,6 +6,10 @@
 # in one segment the IQ complex point should be a multiple of 16, and the total amount should be more than 32
 # digital channel 1 can only be task trigger by output ch1, ch2, and digital channel 2 can only be task trigger by output ch3, ch4,
 #  In IQ mode, the output V_{pp} has a 3dB reduction
+# always finish programming one channel, and then go to another
+# if one coherent DDC and DUC, they should have the same NCO freq. And DAC clock should be a multiple of ADC clock
+
+
 # =============================================================================
 from typing import Optional
 from astropy.units.quantity_helper.helpers import degree_to_radian_ufuncs
@@ -25,13 +29,16 @@ DAC_min_segment_length = 32
 DAC_min_segment_length_ns = DAC_min_segment_length / (SampleRateDAC_IQ / 1E9)
 DAC_granularity_ns = DAC_granularity / (SampleRateDAC_IQ / 1E9)
 
+
+decimation_ADC=16
 SampleRateADC = SampleRateDAC / 4
-SampleRateADC_IQ = SampleRateADC / 16  # decimation x16
+SampleRateADC_IQ = SampleRateADC / decimation_ADC
+
 
 ADC_granularity = 48  # 48 complex points
 ADC_granularity_ns = ADC_granularity / (SampleRateADC_IQ / 1E9)
 
-digitizer_system_delay = 560E-9
+digitizer_system_delay = 0
 
 
 # =============================================================================
@@ -97,73 +104,66 @@ def connect_PXI(sid: Optional[int] = 8
     return inst
 
 
-def configurate_all_DAC(inst,
-                        ext_trigger_source_DAC: np.ndarray[int],
-                        carrier_frequency: np.ndarray[float],
-                        output_Vpp: Optional[np.ndarray[np.float64]] = np.array([0.2, 0.2, 0.2, 0.2]),
+def configurate_one_DAC(inst,
+                        channel:int,
+                        carrier_frequency: float,
+                        trigger_channel:int,
+                        trigger_setting:Optional[dict]={'trigger_level':0.5,'trigger_delay':0},
+                        output_Vpp: Optional[float] = 0.5,
                         ):
     '''
-    configure the DAC output, set up IQ mode, DUC mode, sampling frequency, output level
+    configure the DAC output, set up IQ mode, DUC mode, sampling frequency, output level.
+    Note: always finish configuring one channel first, and then another
 
     :param inst: the inst object
-    :param ext_trigger_source_DAC: the trigger source for each channel: 0:not configurate, 1: TRG1, 2: TRG2
-    :param carrier_frequency: the carrier frequencies for up conversion, [ch1,ch2,ch3,ch4], unit Hz
-    :param output_Vpp: the output level of after IQ, [ch1,ch2,ch3,ch4], unit V
+    :param channel: the DAC channel number
+    :param carrier_frequency: the carrier frequencies for up conversion, unit Hz
+    :param trigger_channel: the trigger channel number
+    :param trigger_setting: key={'trigger_level', 'trigger_delay'}
+    :param output_Vpp: the output level of after IQ unit V
     :return: None
     '''
-    assert (len(ext_trigger_source_DAC) == 4) & (
-        np.all(np.isin(ext_trigger_source_DAC, [0, 1, 2]))), "ext trigger source has to be TRG1/TRG2"
-    print('DAC sample rate {0}GS/s, SCLK {1}GS/s'.format(SampleRateDAC_IQ / 1E9, SampleRateDAC / 1E9))
-    print('DAC minimun segment length {0}ns, segment granuality {1}ns' \
+    assert (trigger_channel==1)|(trigger_channel==1), "ext trigger source has to be TRG1/TRG2"
+    print('DAC sample rate {0:.2f}GS/s, SCLK {1:.2f}GS/s'.format(SampleRateDAC_IQ / 1E9, SampleRateDAC / 1E9))
+    print('DAC minimun segment length {0:.1f}ns, segment granuality {1:.1f}ns' \
           .format(DAC_min_segment_length_ns, DAC_granularity_ns))
-    output_Vpp_IQ = output_Vpp * 2  # the waveform after IQ modulation have 3dB reduction
 
-    for ch in np.arange(4) + 1:
-        assert (output_Vpp_IQ[ch - 1] <= 1.2) & (
-                output_Vpp_IQ[ch - 1] >= 1E-3), "Vpp value not allowed, have to be between 0.5E-3 and 0.6"
-        assert (carrier_frequency[ch - 1] <= 1E9) & (
-                carrier_frequency[ch - 1] >= 0), "NCO freq should be between DC to 1GHz"
-        inst.send_scpi_cmd(':INST:CHAN {0}'.format(ch))
-        inst.send_scpi_cmd(':FREQ:RAST {0}'.format(2.5E9))  # force DAC to 16 bits
-        inst.send_scpi_cmd(':INIT:CONT OFF')
-        inst.send_scpi_cmd(':TRAC:DEL:ALL')
-        if ext_trigger_source_DAC[ch - 1] != 0:
-            inst.send_scpi_cmd(':TRIG:SOUR:ENAB TRG{}'.format(ext_trigger_source_DAC[ch - 1]))
-        # configurate IQ mode
-        inst.send_scpi_cmd(':SOUR:MODE DUC')
-        inst.send_scpi_cmd(':SOUR:INT X8')
-        inst.send_scpi_cmd(':SOUR:IQM ONE')
-        inst.send_scpi_cmd(':FREQ:RAST {0}'.format(SampleRateDAC))
-        inst.send_scpi_cmd(':SOUR:NCO:CFR1 {0}'.format(carrier_frequency[ch - 1]))
-        inst.send_scpi_cmd(':VOLT {}'.format(output_Vpp_IQ[ch - 1]))
+    assert (output_Vpp <= 0.5) & (
+            output_Vpp >= 1E-3), "Vpp value not allowed, have to be between 0.5E-3 and 0.25"
+    assert (carrier_frequency <= 1E9) & (
+            carrier_frequency >= 0), "NCO freq should be between DC to 1GHz"
 
-    check_error_SCPI(inst, 'DAC configuration error')
+    # initialize DAC
+    inst.send_scpi_cmd(':INST:CHAN {0}'.format(channel))
+    inst.send_scpi_cmd(':FREQ:RAST {0}'.format(2.5E9))  # force DAC to 16 bits
+    inst.send_scpi_cmd(':INIT:CONT ON')
+    inst.send_scpi_cmd(':TRAC:DEL:ALL')
+    inst.send_scpi_cmd(':TRIG:SOUR:ENAB TRG{}'.format(trigger_channel))
+
+    check_error_SCPI(inst, 'channel {} DAC initialization error'.format(channel))
+
+    # configurate trigger
+    inst.send_scpi_cmd(':TRIG:SELECT TRG{}'.format(trigger_channel))
+    inst.send_scpi_cmd(':TRIG:LTJ ON')
+    inst.send_scpi_cmd(':TRIG:LEV {}'.format(trigger_setting['trigger_level']))
+    inst.send_scpi_cmd(':TRIG:DEL {}'.format(trigger_setting['trigger_delay']))
+    inst.send_scpi_cmd(':TRIG:SLOP POS')
+    inst.send_scpi_cmd(':TRIG:COUP ON')
+    inst.send_scpi_cmd(':TRIG:STAT ON')
+
+    check_error_SCPI(inst, 'channel {} trigger configuration error'.format(channel))
+
+    # configurate IQ mode
+    inst.send_scpi_cmd(':SOUR:MODE DUC')
+    inst.send_scpi_cmd(':SOUR:INT X8')
+    inst.send_scpi_cmd(':SOUR:IQM ONE')
+    inst.send_scpi_cmd(':FREQ:RAST {0}'.format(SampleRateDAC))
+    inst.send_scpi_cmd(':SOUR:NCO:CFR1 {0}'.format(carrier_frequency))
+    inst.send_scpi_cmd(':NCO:SIXD1 ON')
+    inst.send_scpi_cmd(':VOLT {}'.format(output_Vpp))
+
+    check_error_SCPI(inst, 'channel {} IQ configuration error'.format(channel))
     print('DAC configuration successful')
-    return
-
-
-def configurate_all_trigger(inst,
-                            trigger_level: Optional[np.ndarray[np.float64]] = np.array([0.5, 0.5]),
-                            trigger_delay: Optional[np.ndarray[np.float64]] = np.array([0E-9, 0E-9]),
-                            ):
-    '''
-    configure the trigger
-
-    :param inst: the inst object
-    :param trigger_level: voltage needed to trigger
-    :param trigger_delay: delay between receiving trigger and execute
-    :return: None
-    '''
-    for trigger_ch in np.arange(2) + 1:
-        inst.send_scpi_cmd(':TRIG:SELECT TRG{}'.format(trigger_ch))
-        inst.send_scpi_cmd(':TRIG:LTJ ON')
-        inst.send_scpi_cmd(':TRIG:LEV {}'.format(trigger_level[trigger_ch - 1]))
-        inst.send_scpi_cmd(':TRIG:DEL {}'.format(trigger_delay[trigger_ch - 1]))
-        inst.send_scpi_cmd(':TRIG:SLOP POS')
-        inst.send_scpi_cmd(':TRIG:COUP ON')
-        inst.send_scpi_cmd(':TRIG:STAT ON')
-    check_error_SCPI(inst, 'trigger configuration error')
-    print('trigger configuration successful')
     return
 
 
@@ -171,12 +171,15 @@ class segment(object):
     ''' the building block of pulse sequence '''
 
     def __init__(self,
-                 address: dict
+                 inst,
+                 segnum:int
                  ):
         '''
-        :param address: key={'inst','channel','segment'}
+        :param inst: the inst object
+        :param segnum: the segment number being defined
         '''
-        self.address = address
+        self.inst=inst
+        self.segnum=segnum
         self.I = np.array([])
         self.Q = np.array([])
         return
@@ -218,12 +221,12 @@ class segment(object):
         '''
         customize a pulse. Need to input I, Q component as np array
 
-        :param I: I component, in analog form, normalized
+        :param I: I component, in analog form, normalized to -0.5 to +0.5
         :param Q: Q component, in analog form, normalized
         :return: None
         '''
         assert I.shape == Q.shape, 'I,Q components must have same length'
-        assert (np.max(np.abs(I)) <= 1) & (np.max(np.abs(Q)) <= 1), 'should input normalized I, Q components'
+        assert (np.max(np.abs(I)) <= 0.5) & (np.max(np.abs(Q)) <= 0.5), 'should input normalized I, Q components'
         self.I = np.append(self.I, I)
         self.Q = np.append(self.Q, Q)
         return
@@ -237,10 +240,19 @@ class segment(object):
         :return: None
         '''
 
-        # checking errors
+        # analog to digital conversion
+        inst=self.inst
+        segnum = self.segnum
+        IQ_digital = analog_to_digital_IQ(self.I, self.Q)
+
+        # safety check
         assert self.I.shape == self.Q.shape, 'I,Q components must have same length'
         assert (np.max(np.abs(self.I)) <= 1 / 2) & (
                 np.max(np.abs(self.Q)) <= 1 / 2), 'should input normalized I, Q components'
+
+        signal_amplitude=np.sqrt((2*self.I)**2 + (2*self.Q)**2)
+        volt=float(inst.send_scpi_query(':VOLT?'))
+        assert np.max(signal_amplitude*volt)<=0.5, 'I, Q component not orthogonal, may be clipping happening, tune down voltage'
 
         if len(self.I) < DAC_min_segment_length:
             filled_number = DAC_min_segment_length - len(self.I)
@@ -259,14 +271,7 @@ class segment(object):
             print('Warning: Pulse length not a multiple of {0}, has zero filled {1} numbers'.format(DAC_granularity,
                                                                                                     filled_number))
 
-        # analog to digital conversion
-        inst = self.address['inst']
-        ch = self.address['channel']
-        segnum = self.address['segment']
-        IQ_digital = analog_to_digital_IQ(self.I, self.Q)
-
         # download waveform to FPGA
-        inst.send_scpi_cmd(':INST:CHAN {0}'.format(ch))
         inst.send_scpi_cmd(':TRAC:DEF {0}, {1}'.format(segnum, len(IQ_digital)))
         inst.send_scpi_cmd(':TRAC:SEL {0}'.format(segnum))
         # Increase the timeout before writing binary-data:
@@ -275,8 +280,9 @@ class segment(object):
         inst.write_binary_data('*OPC?; :TRAC:DATA', IQ_digital)
         # Set normal timeout
         inst.timeout = 10000
+        ch=int(inst.send_scpi_query(':INST:CHAN?'))
         check_error_SCPI(inst, 'IQ waveform streaming error, channel:{0}, segment:{1}'.format(ch, segnum))
-        print('channel {0}, segment {1} downloaded'.format(ch, segnum))
+        print('channel {0}, segment {1} downloaded, length {2:.1f}ns'.format(ch, segnum,len(self.I)/SampleRateDAC_IQ*1E9))
         return
 
 
@@ -284,24 +290,22 @@ class task_table(object):
     '''task table put segment in specific order to execute'''
 
     def __init__(self,
-                 address: dict,
+                 inst,
                  length: int
                  ):
         '''
         reset the task table at a specific channel and define a new one
 
-        :param address: key={'inst','channel'}
+        :param inst: the inst object
         :param length: length of the task table
         :return: None
         '''
-        self.address = address
+        self.inst=inst
         self.length = length
         # initialize the channel task table
-        inst = self.address['inst']
-        ch = self.address['channel']
-        inst.send_scpi_cmd(':INST:CHAN {0}'.format(ch))
-        inst.send_scpi_cmd(':TASK:ZERO:ALL')
+        inst = self.inst
         inst.send_scpi_cmd(':TASK:COMP:LENG {}'.format(self.length))
+        ch = int(inst.send_scpi_query(':INST:CHAN?'))
         check_error_SCPI(inst, 'Defining task table at channel {} failed'.format(ch))
         return
 
@@ -330,9 +334,7 @@ class task_table(object):
         :return: None
         '''
 
-        inst = self.address['inst']
-        ch = self.address['channel']
-        inst.send_scpi_cmd(':INST:CHAN {0}'.format(ch))
+        inst = self.inst
         assert (tasknum >= 1) & (tasknum <= self.length), 'input task number out of range, increase task table length'
         inst.send_scpi_cmd(':TASK:COMP:SEL {0}'.format(tasknum))
         inst.send_scpi_cmd(':TASK:COMP:SEGM {0}'.format(segnum))
@@ -340,25 +342,26 @@ class task_table(object):
             inst.send_scpi_cmd(':TASK:COMP:ENAB TRG{}'.format(ext_trigger_ch))
         if digitizer_trigger:
             inst.send_scpi_cmd(':TASK:COMP:DTR ON')
-        inst.send_scpi_cmd(':TASK:COMP:NEXT1 {0}'.format(next_task))
         inst.send_scpi_cmd(':TASK:COMP:LOOP {0}'.format(loop))
+        inst.send_scpi_cmd(':TASK:COMP:NEXT1 {0}'.format(next_task))
+
 
         # define delay before next task
         delay_in_SCLK = round(delay * 8)
         assert (delay_in_SCLK >= 0) & (delay_in_SCLK <= 65536), \
             'delay should be between 0ns and 8192ns, use external trigger if larger delay needed'
         inst.send_scpi_cmd(':TASK:COMP:DEL {0}'.format(delay_in_SCLK))
+        ch = int(inst.send_scpi_query(':INST:CHAN?'))
         check_error_SCPI(inst, 'Defining new task in channel {0}, task number {1} failed'.format(ch, tasknum))
         return
 
     def download_task_table(self):
         '''write the task table to Proteus after defining them'''
-        inst = self.address['inst']
-        ch = self.address['channel']
-        inst.send_scpi_cmd(':INST:CHAN {0}'.format(ch))
+        inst = self.inst
         inst.send_scpi_cmd(':TASK:COMP:WRITE')
         inst.send_scpi_cmd(':SOUR:FUNC:MODE TASK')
         inst.send_scpi_cmd(':OUTP ON')
+        ch = int(inst.send_scpi_query(':INST:CHAN?'))
         check_error_SCPI(inst, 'download task table at channel {0} failed'.format(ch))
         print('channel {} task table downloaded'.format(ch))
         return
@@ -370,7 +373,7 @@ class digitizer(object):
     def __init__(self,
                  address: dict,
                  task_trigger_channel: int,
-                 carrier_frequency: np.ndarray[float],
+                 carrier_frequency: float,
                  numframes: int,
                  framelen: int,
                  delay: Optional[np.float64] = digitizer_system_delay
@@ -386,8 +389,8 @@ class digitizer(object):
         :delay: the delay time before acquisition. This it usually set to the system delay of this digitizer
         :return: None
         '''
-        print('digitizer sample rate {0}GS/s, SCLK {1}GS/s'.format(SampleRateADC / 1E9, SampleRateADC_IQ / 1E9))
-        print('digitizer granularity {}ns'.format(ADC_granularity_ns))
+        print('digitizer sample rate {0:.2f}GS/s, SCLK {1:.2f}GS/s'.format(SampleRateADC_IQ / 1E9, SampleRateADC / 1E9))
+        print('digitizer granularity {:.1f}ns'.format(ADC_granularity_ns))
 
         remainder = framelen % ADC_granularity
         if remainder != 0:
@@ -412,17 +415,17 @@ class digitizer(object):
         totlen = numframes * framelen
         stored_waveform = np.zeros(totlen, dtype=np.uint32)
         self.stored_waveform = stored_waveform
-        print('Channel {0} aquisition frame Length {1}, frame number {2}' \
-              .format(ch, framelen / 2 / SampleRateADC * 16, numframes))  # x16 decimation
+        print('Channel {0} acquisition frame Length {1:.1f} ns, frame number {2}' \
+              .format(ch, framelen / 2 / SampleRateADC * decimation_ADC*1E9, numframes))
 
         # overall digitizer settings
         inst.send_scpi_cmd(':DIG:MODE DUAL')
-        inst.send_scpi_cmd(':DIG:FREQ  {0}'.format(SampleRateADC))
+        inst.send_scpi_cmd(':DIG:FREQ {0}'.format(SampleRateADC))
 
         # setting regarding the specific channel
         inst.send_scpi_cmd(':DIG:CHAN:SEL {}'.format(ch))
-        inst.send_scpi_cmd(':DIG:INIT OFF')
         inst.send_scpi_cmd(':DIG:DDC:MODE COMP')
+        inst.send_scpi_cmd(':DIG:DDC:DEC X{}'.format(decimation_ADC))
         inst.send_scpi_cmd(':DIG:DDC:CFR1 {0}'.format(carrier_frequency))
         inst.send_scpi_cmd(':DIG:DDC:PHAS1 0')
         inst.send_scpi_cmd(':DIG:DDC:CLKS AWG')
@@ -430,7 +433,7 @@ class digitizer(object):
 
         # delay is for individual task list, but not for individual digitizer
         inst.send_scpi_cmd(':DIG:TRIG:SOURCE TASK{}'.format(task_trigger_channel))
-        inst.send_scpi_cmd(':INST:CHAN:SEL {}'.format(task_trigger_channel))
+        inst.send_scpi_cmd(':INST:CHAN:SEL {0}'.format(task_trigger_channel))
         inst.send_scpi_cmd(':DIG:TRIG:AWG:TDEL {0}'.format(delay))
         inst.send_scpi_cmd(':DIG:ACQuire:FRAM:DEF {0},{1}'.format(numframes, framelen))
 
@@ -439,6 +442,7 @@ class digitizer(object):
         inst.send_scpi_cmd(':DIG:ACQuire:FRAM:CAPT {0},{1}'.format(capture_first, capture_count))
 
         # trigger the digitizer
+        inst.send_scpi_cmd(':DIG:INIT OFF')
         inst.send_scpi_cmd(':DIG:INIT ON')
         inst.send_scpi_cmd('*TRG')
 
@@ -492,5 +496,5 @@ class digitizer(object):
         self.wavI = self.wavI.astype(float)
         self.wavQ = self.wavQ.astype(float)
         check_error_SCPI(inst, 'reading digitizer data failed')
-        print('acquired {} complex points'.format(len(self.wavI)))
+        print('acquired {0} complex points, {1:.1f}ns'.format(len(self.wavI),len(self.wavI)/SampleRateDAC_IQ*1E9))
         return
