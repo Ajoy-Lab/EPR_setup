@@ -31,9 +31,22 @@
 # all the ADC channel have independent NCO
 
 # =============================================================================
+# existing problem which cannot avoid
+#
+# 32ns digitizer trigger jitter: this cannot be solved! if doing echo detection, integrate the echo intensity in every
+# rep of experiment. If acquiring FID, process the data for each rep, do the phase correction manually or take the
+# absolute value of the spectrum and add
+#
+# I, Q component reversal: when using external trigger, sometimes the IQ output becomes QI output. However, according to
+# testing, if keeping the NCO frequency of DAC channel a constant, the reversal situation will be the same (always IQ or
+# QI)
+
+
 from typing import Optional
 from AWG_function.teproteus import TEProteusAdmin as TepAdmin
 import numpy as np
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.spatial.distance import pdist
 
 # =============================================================================
 # constant, do not change if you are unsure!!!!
@@ -392,7 +405,7 @@ class digitizer(object):
                  task_trigger_channel: int,
                  carrier_frequency: float,
                  numframes: int,
-                 framelen: int,
+                 framelen_IQ: int,
                  delay: Optional[np.float64] = digitizer_system_delay
                  ):
         '''
@@ -402,13 +415,14 @@ class digitizer(object):
         :param task_trigger_channel: the trigger DAC channel of the digitizer
         :param carrier_frequency: the carrier frequency for DDC
         :param numframes: the number of frames to acquire
-        :param framelen: the length of each frame
+        :param framelen_IQ: the number of complex point in each frame
         :delay: the delay time before acquisition. This it usually set to the system delay of this digitizer
         :return: None
         '''
         print('digitizer sample rate {0:.2f}GS/s, SCLK {1:.2f}GS/s'.format(SampleRateADC_IQ / 1E9, SampleRateADC / 1E9))
         print('digitizer granularity {:.1f}ns'.format(ADC_granularity_ns))
 
+        framelen = 2 * framelen_IQ
         remainder = framelen % ADC_granularity
         if remainder != 0:
             filled_number = ADC_granularity - remainder
@@ -512,5 +526,137 @@ class digitizer(object):
         self.wavI = self.wavI.astype(float)
         self.wavQ = self.wavQ.astype(float)
         check_error_SCPI(inst, 'reading digitizer data failed')
-        print('acquired {0} complex points, {1:.1f}ns'.format(len(self.wavI), len(self.wavI) / SampleRateDAC_IQ * 1E9))
+        print('acquired {0} complex points, {1:.1f}ns'.format(len(self.wavI), len(self.wavI) / SampleRateADC_IQ * 1E9))
         return
+
+def sinc_interpolation(discrete_signal, discrete_t, interpolation_t):
+    BW = 1 / (discrete_t[1] - discrete_t[0])
+    reconstructed_signal = np.zeros_like(interpolation_t, dtype=complex)
+    for i, t in enumerate(interpolation_t):
+        sinc_values = BW * np.sinc((t - discrete_t) * BW)
+        reconstructed_signal[i] = np.sum(discrete_signal * sinc_values)
+    return reconstructed_signal
+
+class EPR_data(object):
+    '''store the data for processing'''
+
+    def __init__(self,
+                 signal_digitizer: digitizer,
+                 auxiliary_digitizer: digitizer,
+                 rep_no: int,
+                 ):
+        '''
+        Input the raw data from digitizer. Assuming data from several experiments are read out in one shot, each experiment is repeated rep_no times
+
+        :param signal_digitizer:the digitizer used to acquire data
+        :param auxiliary_digitizer:the digitizer used to measure jitter and detect Proteus error
+        :param rep_no:Number of repetitions for each experiment
+        :return: None
+        '''
+
+        self.exp_no = int(np.round(signal_digitizer.numframes / rep_no))
+        self.rep_no = rep_no
+        self.length = int(np.round(signal_digitizer.framelen / 2))
+        self.SampleRateDAC_IQ = signal_digitizer.SampleRateADC / 16
+        self.length_s = self.length / self.SampleRateDAC_IQ
+        print('recognize {0} experiments, {1} repetitions, length {2:.1f}ns, {3} samples'.
+              format(self.exp_no, self.rep_no, self.length / self.SampleRateDAC_IQ * 1E9, self.length))
+
+        # fragment the signal
+        signal = np.zeros((self.exp_no * self.rep_no, self.length), dtype=complex)
+        for i in range(self.exp_no * self.rep_no):
+            signal[i] = signal_digitizer.wavI[self.length * i:self.length * (i + 1)] + 1j * signal_digitizer.wavQ[
+                                                                                            self.length * i:self.length * (
+                                                                                                    i + 1)]
+
+        auxiliary = np.zeros((self.exp_no * self.rep_no, self.length), dtype=complex)
+        for i in range(self.exp_no * self.rep_no):
+            auxiliary[i] = auxiliary_digitizer.wavI[
+                           self.length * i:self.length * (i + 1)] + 1j * auxiliary_digitizer.wavQ[
+                                                                         self.length * i:self.length * (i + 1)]
+
+        self.signal = signal
+        self.auxiliary = auxiliary
+
+    def interpolation(self,
+                      interpolation_factor: Optional[int] = 16
+                      ):
+        '''
+        since x16 decimation is mandatory in Proteus, need to do x16 interpolation before aligning
+
+        :param interpolation_factor:the interpolation factor, default is 16
+        :return: none
+        '''
+        discrete_t = np.linspace(0, self.length_s, self.length, endpoint=False)
+        interpolation_t = np.linspace(0, self.length_s, self.length * interpolation_factor, endpoint=False)
+
+        interpolated_signal = np.zeros((self.exp_no * self.rep_no, self.length * interpolation_factor),
+                                       dtype=complex)
+        interpolated_auxiliary = np.zeros((self.exp_no * self.rep_no, self.length * interpolation_factor),
+                                          dtype=complex)
+
+        for i in range(self.exp_no * self.rep_no):
+            interpolated_signal[i] = sinc_interpolation(self.signal[i], discrete_t, interpolation_t)
+        for i in range(self.exp_no * self.rep_no):
+            interpolated_auxiliary[i] = sinc_interpolation(self.auxiliary[i], discrete_t, interpolation_t)
+
+        print('interpolation completed, signal length {}'.format(self.length * interpolation_factor))
+
+        self.signal = interpolated_signal
+        self.auxiliary = interpolated_auxiliary
+
+    def align(self,
+              start_sample_slack: Optional[int] = 63,
+              end_sample_slack: Optional[int] = 63,
+              reference: Optional[int] = 0,
+              ):
+        '''
+        align each waveform according to the detected jitter in auxiliary digitizer
+        note that lag range from -63 to 63, so should at least leave 63 samples slack in the start and end sample
+
+        :param start_sample_slack:the index of the first sample we want to capture
+        :param end_sample_slack:the index of the last sample we want to capture=length of signal-end_sample
+        :return: the lag got
+        '''
+
+        lag = np.zeros(self.exp_no * self.rep_no, dtype=int)
+        for i in range(self.exp_no * self.rep_no):
+            correlation = np.correlate(
+                np.real(self.auxiliary[reference]), np.real(self.auxiliary[i]), mode='full')
+            lag[i] = int(np.argmax(correlation) - (len(self.auxiliary[0]) - 1))
+        start_sample = start_sample_slack
+        end_sample = len(self.signal[0]) - end_sample_slack
+
+        self.signal = np.array(
+            [self.signal[i, start_sample - lag[i]:end_sample - lag[i]] for i in range(self.exp_no * self.rep_no)],
+            dtype=complex)
+
+        self.auxiliary = np.array(
+            [self.auxiliary[i, start_sample - lag[i]:end_sample - lag[i]] for i in
+             range(self.exp_no * self.rep_no)],
+            dtype=complex)
+
+        return lag
+
+    def fix_error(self,
+                  reps_kept: int
+                  ):
+        '''
+        This function use hierarchical clustering algorithm, delete all the experiments where Proteus IQ bugs happen.
+        And then, choose several data point in the remaining dataset to average.
+
+        :param reps_kept:the number of reps to keep and average for each experiment
+        :return: Indices of the samples in the cluster
+        '''
+        distance_matrix = pdist(np.real(self.auxiliary), metric='euclidean')
+        linkage_matrix = linkage(distance_matrix, method='ward')
+        labels = fcluster(linkage_matrix, 2, criterion='maxclust')
+        labels = labels.reshape(self.rep_no, self.exp_no)
+        indices = [np.where(row == 1)[0][:reps_kept] for row in labels]
+
+        average = np.zeros((self.exp_no, len(self.signal[0])), dtype=complex)
+        for exp in range(self.exp_no):
+            average[exp] = np.average(self.signal[exp * self.rep_no + indices[exp]], axis=0)
+        self.average = average
+
+        return indices
